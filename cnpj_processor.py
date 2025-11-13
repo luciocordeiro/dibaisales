@@ -7,9 +7,8 @@ from dotenv import load_dotenv
 import bs4 as bs
 import os
 import pandas as pd
-import pyodbc
+import psycopg2
 from sqlalchemy import create_engine, text
-from sqlalchemy.engine import URL
 import re
 import sys
 import time
@@ -27,9 +26,9 @@ import tempfile
 # =============================================================================
 
 # Configurações ajustáveis para performance
-MAX_WORKERS = multiprocessing.cpu_count() * 2  # Aproveita melhor os recursos da VM
-CHUNK_SIZE = 500000  # Aumenta o tamanho dos chunks para reduzir I/O
-BULK_INSERT_BATCH = 10000  # Tamanho do lote para inserções bulk
+MAX_WORKERS = multiprocessing.cpu_count() * 2
+CHUNK_SIZE = 500000
+BULK_INSERT_BATCH = 10000
 
 # =============================================================================
 # FUNÇÕES DE CONFIGURAÇÃO E AMBIENTE
@@ -72,8 +71,8 @@ def load_environment_variables():
         "data_url": os.getenv('DADOS_RF_URL'),
         "output_path": os.getenv('OUTPUT_FILES_PATH'),
         "extracted_path": os.getenv('EXTRACTED_FILES_PATH'),
-        "db_driver": os.getenv('DB_DRIVER'),
         "db_server": os.getenv('DB_SERVER'),
+        "db_port": os.getenv('DB_PORT', '5432'),
         "db_user": os.getenv('DB_USER'),
         "db_password": os.getenv('DB_PASSWORD'),
         "db_name": os.getenv('DB_NAME'),
@@ -81,8 +80,7 @@ def load_environment_variables():
     }
 
     if not all([config["data_url"], config["output_path"], config["extracted_path"],
-                config["db_driver"], config["db_server"], config["db_user"], 
-                config["db_password"], config["db_name"]]):
+                config["db_server"], config["db_user"], config["db_password"], config["db_name"]]):
         logging.error("Uma ou mais variáveis de ambiente não foram definidas no arquivo .env.")
         sys.exit(1)
 
@@ -103,6 +101,213 @@ def makedirs(path):
         os.makedirs(path)
 
 # =============================================================================
+# FUNÇÕES DE BANCO DE DADOS (POSTGRESQL)
+# =============================================================================
+
+def get_db_engine(config, db_name=None):
+    """
+    Cria e retorna um engine do SQLAlchemy para PostgreSQL.
+    """
+    from sqlalchemy import create_engine
+    
+    # Use o banco especificado ou o padrão do config
+    if db_name is None:
+        db_name = config["db_name"]
+    
+    # Construa a string de conexão PostgreSQL
+    connection_string = f"postgresql://{config['db_user']}:{config['db_password']}@{config['db_server']}:{config['db_port']}/{db_name}"
+    
+    try:
+        engine = create_engine(
+            connection_string,
+            echo=False,
+            pool_size=20,
+            max_overflow=0
+        )
+        # Teste de conexão
+        with engine.connect() as connection:
+            logging.info(f"✅ Conexão com PostgreSQL '{config['db_server']}' (banco: {db_name}) bem-sucedida!")
+        return engine
+    except Exception as e:
+        logging.error(f"❌ Falha ao conectar com PostgreSQL: {e}")
+        sys.exit(1)
+
+def prepare_database(master_engine, db_name):
+    """
+    Garante que o banco de dados de destino exista e esteja limpo - PostgreSQL version.
+    """
+    logging.info(f"Preparando o banco de dados PostgreSQL '{db_name}'...")
+    
+    with master_engine.connect() as connection:
+        connection = connection.execution_options(isolation_level="AUTOCOMMIT")
+        try:
+            # Verifica se o banco existe
+            result = connection.execute(text(f"SELECT 1 FROM pg_database WHERE datname = '{db_name}'"))
+            exists = result.scalar()
+            
+            if exists:
+                logging.info(f"Removendo o banco de dados '{db_name}'...")
+                # Encerra conexões ativas primeiro
+                connection.execute(text(f"""
+                    SELECT pg_terminate_backend(pid) 
+                    FROM pg_stat_activity 
+                    WHERE datname = '{db_name}' AND pid <> pg_backend_pid()
+                """))
+                connection.execute(text(f"DROP DATABASE IF EXISTS {db_name}"))
+            
+            logging.info(f"Criando o banco de dados '{db_name}'...")
+            connection.execute(text(f"CREATE DATABASE {db_name}"))
+            logging.info(f"✅ Banco de dados '{db_name}' criado com sucesso.")
+            
+        except Exception as e:
+            logging.error(f"❌ Falha ao preparar o banco de dados '{db_name}': {e}")
+            sys.exit(1)
+
+def setup_database_tables(engine):
+    """
+    Cria ou recria todas as tabelas necessárias no banco de dados usando o engine do SQLAlchemy.
+    """
+    logging.info("--- CONFIGURANDO TABELAS NO BANCO DE DADOS ---")
+
+    # Schemas para as tabelas PostgreSQL
+    table_schemas = {
+        'empresa': """
+            CREATE TABLE empresa (
+                cnpj_basico VARCHAR(8) PRIMARY KEY,
+                razao_social VARCHAR(255),
+                natureza_juridica VARCHAR(4),
+                qualificacao_responsavel VARCHAR(2),
+                capital_social VARCHAR(20),
+                porte_empresa VARCHAR(2),
+                ente_federativo_responsavel VARCHAR(4)
+            )
+        """,
+        'estabelecimento': """
+            CREATE TABLE estabelecimento (
+                cnpj_basico VARCHAR(8),
+                cnpj_ordem VARCHAR(4),
+                cnpj_dv VARCHAR(2),
+                identificador_matriz_filial VARCHAR(1),
+                nome_fantasia VARCHAR(255),
+                situacao_cadastral VARCHAR(2),
+                data_situacao_cadastral VARCHAR(8),
+                motivo_situacao_cadastral VARCHAR(2),
+                nome_cidade_exterior VARCHAR(255),
+                pais VARCHAR(3),
+                data_inicio_atividade VARCHAR(8),
+                cnae_fiscal_principal VARCHAR(7),
+                cnae_fiscal_secundaria TEXT,
+                tipo_logradouro VARCHAR(20),
+                logradouro VARCHAR(255),
+                numero VARCHAR(20),
+                complemento VARCHAR(255),
+                bairro VARCHAR(255),
+                cep VARCHAR(8),
+                uf VARCHAR(2),
+                municipio VARCHAR(4),
+                ddd_1 VARCHAR(4),
+                telefone_1 VARCHAR(20),
+                ddd_2 VARCHAR(4),
+                telefone_2 VARCHAR(20),
+                ddd_fax VARCHAR(4),
+                fax VARCHAR(20),
+                correio_eletronico VARCHAR(255),
+                situacao_especial VARCHAR(2),
+                data_situacao_especial VARCHAR(8)
+            )
+        """,
+        'socios': """
+            CREATE TABLE socios (
+                cnpj_basico VARCHAR(8),
+                identificador_socio VARCHAR(1),
+                nome_socio_razao_social VARCHAR(255),
+                cpf_cnpj_socio VARCHAR(14),
+                qualificacao_socio VARCHAR(2),
+                data_entrada_sociedade VARCHAR(8),
+                pais VARCHAR(3),
+                representante_legal VARCHAR(11),
+                nome_do_representante VARCHAR(255),
+                qualificacao_representante_legal VARCHAR(2),
+                faixa_etaria VARCHAR(1)
+            )
+        """,
+        'simples': """
+            CREATE TABLE simples (
+                cnpj_basico VARCHAR(8),
+                opcao_pelo_simples VARCHAR(1),
+                data_opcao_simples VARCHAR(8),
+                data_exclusao_simples VARCHAR(8),
+                opcao_mei VARCHAR(1),
+                data_opcao_mei VARCHAR(8),
+                data_exclusao_mei VARCHAR(8)
+            )
+        """,
+        'cnae': """
+            CREATE TABLE cnae (
+                codigo VARCHAR(7) PRIMARY KEY,
+                descricao VARCHAR(255)
+            )
+        """,
+        'moti': """
+            CREATE TABLE moti (
+                codigo VARCHAR(2) PRIMARY KEY,
+                descricao VARCHAR(255)
+            )
+        """,
+        'munic': """
+            CREATE TABLE munic (
+                codigo VARCHAR(4) PRIMARY KEY,
+                descricao VARCHAR(255)
+            )
+        """,
+        'natju': """
+            CREATE TABLE natju (
+                codigo VARCHAR(4) PRIMARY KEY,
+                descricao VARCHAR(255)
+            )
+        """,
+        'pais': """
+            CREATE TABLE pais (
+                codigo VARCHAR(3) PRIMARY KEY,
+                descricao VARCHAR(255)
+            )
+        """,
+        'quals': """
+            CREATE TABLE quals (
+                codigo VARCHAR(2) PRIMARY KEY,
+                descricao VARCHAR(255)
+            )
+        """
+    }
+
+    with engine.connect() as connection:
+        for table_name, ddl in table_schemas.items():
+            logging.info(f"  - Recriando tabela '{table_name}'...")
+            
+            # Remove tabela se existir
+            connection.execute(text(f"DROP TABLE IF EXISTS {table_name} CASCADE;"))
+            # Cria nova tabela
+            connection.execute(text(ddl))
+
+        connection.commit()
+    logging.info("Tabelas configuradas com sucesso.")
+
+def create_database_indexes(engine):
+    """Cria índices nas tabelas para otimizar as consultas."""
+    logging.info("--- CRIANDO ÍNDICES NO BANCO DE DADOS ---")
+    with engine.connect() as connection:
+        try:
+            logging.info("Criando índices...")
+            connection.execute(text("CREATE INDEX IF NOT EXISTS idx_empresa_cnpj ON empresa(cnpj_basico);"))
+            connection.execute(text("CREATE INDEX IF NOT EXISTS idx_estabelecimento_cnpj ON estabelecimento(cnpj_basico);"))
+            connection.execute(text("CREATE INDEX IF NOT EXISTS idx_socios_cnpj ON socios(cnpj_basico);"))
+            connection.execute(text("CREATE INDEX IF NOT EXISTS idx_simples_cnpj ON simples(cnpj_basico);"))
+            connection.commit()
+            logging.info("Índices criados com sucesso para a coluna `cnpj_basico`.")
+        except Exception as e:
+            logging.warning(f"Não foi possível criar os índices. Eles podem já existir. Erro: {e}")
+
+# =============================================================================
 # FUNÇÕES DE DOWNLOAD E EXTRAÇÃO (OTIMIZADAS)
 # =============================================================================
 
@@ -121,7 +326,7 @@ def download_data_files(data_url, output_path):
             files_to_download = get_zip_files_from_url(latest_data_url)
             data_url = latest_data_url
         except (urllib.error.URLError, SystemExit):
-            sys.exit(1)  # Erro já foi logado pelas funções filhas
+            sys.exit(1)
 
     logging.info(f'Encontrados {len(files_to_download)} arquivos para download')
     
@@ -238,148 +443,6 @@ def bar_progress(current, total, width=80):
     sys.stdout.flush()
 
 # =============================================================================
-# FUNÇÕES DE BANCO DE DADOS (OTIMIZADAS)
-# =============================================================================
-
-def get_db_engine(config, db_name=None):
-    """
-    Cria e retorna um engine do SQLAlchemy para o SQL Server.
-    Se 'db_name' é None, usa o banco de dados padrão do servidor (geralmente 'master').
-    """
-    # Se db_name não for fornecido, não especifica um banco de dados na URL,
-    # conectando-se ao padrão do servidor (master).
-    database = db_name if db_name else config["db_name"]
-    
-    connection_url = URL.create(
-        "mssql+pyodbc",
-        username=config["db_user"],
-        password=config["db_password"],
-        host=config["db_server"],
-        database=database,
-        query={
-            "driver": config["db_driver"],
-            "autocommit": "True",
-            "fast_executemany": "True"  # Otimização para inserts rápidos
-        },
-    )
-    
-    try:
-        engine = create_engine(
-            connection_url,
-            echo=False,  # Desativa logging de SQL para melhor performance
-            pool_size=20,
-            max_overflow=0
-        )
-        # Testa a conexão
-        with engine.connect() as connection:
-            db_context = database if database else 'master'
-            logging.info(f"Conexão com o servidor SQL '{config['db_server']}' (banco: {db_context}) bem-sucedida!")
-        return engine
-    except Exception as e:
-        if 'Login failed' in str(e):
-            logging.error("Falha de logon. Verifique se o usuário e a senha no seu arquivo .env estão corretos.")
-        logging.error(f"Falha ao criar engine de conexão com o SQL Server. Erro: {e}")
-        sys.exit(1)
-
-def prepare_database(master_engine, db_name):
-    """
-    Garante que o banco de dados de destino exista e esteja limpo.
-    Usa um engine conectado ao 'master' para realizar as operações de DROP e CREATE.
-    """
-    logging.info(f"Preparando o banco de dados '{db_name}'...")
-    with master_engine.connect() as connection:
-        connection = connection.execution_options(isolation_level="AUTOCOMMIT")
-        try:
-            # Verifica se o banco já existe
-            result = connection.execute(text(f"SELECT COUNT(*) FROM sys.databases WHERE name = '{db_name}'")).scalar()
-            
-            if result > 0:
-                logging.info(f"Banco de dados '{db_name}' já existe. Recriando...")
-                # Desconecta todas as conexões existentes
-                connection.execute(text(f"""
-                    ALTER DATABASE [{db_name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
-                    DROP DATABASE [{db_name}];
-                """))
-            
-            logging.info(f"Criando o banco de dados '{db_name}'...")
-            connection.execute(text(f"""
-                CREATE DATABASE [{db_name}]
-                ON PRIMARY 
-                (NAME = '{db_name}_data', 
-                 FILENAME = '/var/opt/mssql/data/{db_name}_data.mdf', 
-                 SIZE = 500MB, 
-                 MAXSIZE = UNLIMITED, 
-                 FILEGROWTH = 100MB)
-                LOG ON 
-                (NAME = '{db_name}_log',
-                 FILENAME = '/var/opt/mssql/data/{db_name}_log.ldf',
-                 SIZE = 100MB,
-                 MAXSIZE = UNLIMITED,
-                 FILEGROWTH = 50MB);
-            """))
-            logging.info(f"Banco de dados '{db_name}' criado com sucesso.")
-        except Exception as e:
-            logging.error(f"Falha ao preparar o banco de dados '{db_name}'. Erro: {e}")
-            logging.error("Verifique as permissões do usuário no servidor SQL.")
-            sys.exit(1)
-
-def setup_database_tables(engine):
-    """
-    Cria ou recria todas as tabelas necessárias no banco de dados usando o engine do SQLAlchemy.
-    Lê os arquivos .sql do diretório 'sql/ddl'.
-    """
-    logging.info("--- CONFIGURANDO TABELAS NO BANCO DE DADOS ---")
-
-    script_dir = pathlib.Path(__file__).parent.resolve()
-    ddl_dir = os.path.join(script_dir, 'sql', 'ddl')
-
-    if not os.path.isdir(ddl_dir):
-        logging.error(f"Diretório de DDL '{ddl_dir}' não encontrado.")
-        sys.exit(1)
-
-    ddl_files = [f for f in os.listdir(ddl_dir) if f.endswith('.sql')]
-
-    with engine.connect() as connection:
-        for ddl_file in sorted(ddl_files):
-            table_name = os.path.splitext(ddl_file)[0]
-            logging.info(f"  - Recriando tabela '{table_name}'...")
-
-            with open(os.path.join(ddl_dir, ddl_file), 'r', encoding='utf-8') as f:
-                ddl_content = f.read()
-
-            # Remove tabela se existir
-            connection.execute(text(f"IF OBJECT_ID('{table_name}', 'U') IS NOT NULL DROP TABLE {table_name};"))
-            # Cria nova tabela
-            connection.execute(text(ddl_content))
-
-        connection.commit()
-    logging.info("Tabelas configuradas com sucesso.")
-
-def create_database_indexes(engine):
-    """Cria índices nas tabelas para otimizar as consultas."""
-    logging.info("--- CRIANDO ÍNDICES NO BANCO DE DADOS ---")
-    with engine.connect() as connection:
-        try:
-            # Remove índices existentes para agilizar a carga
-            logging.info("Removendo índices existentes para agilizar a carga...")
-            connection.execute(text("DROP INDEX IF EXISTS idx_empresa_cnpj ON empresa;"))
-            connection.execute(text("DROP INDEX IF EXISTS idx_estabelecimento_cnpj ON estabelecimento;"))
-            connection.execute(text("DROP INDEX IF EXISTS idx_socios_cnpj ON socios;"))
-            connection.execute(text("DROP INDEX IF EXISTS idx_simples_cnpj ON simples;"))
-            connection.commit()
-            
-            # Recria índices após a carga
-            logging.info("Criando novos índices...")
-            connection.execute(text("CREATE INDEX idx_empresa_cnpj ON empresa(cnpj_basico);"))
-            connection.execute(text("CREATE INDEX idx_estabelecimento_cnpj ON estabelecimento(cnpj_basico);"))
-            connection.execute(text("CREATE INDEX idx_socios_cnpj ON socios(cnpj_basico);"))
-            connection.execute(text("CREATE INDEX idx_simples_cnpj ON simples(cnpj_basico);"))
-            connection.commit()
-            logging.info("Índices criados com sucesso para a coluna `cnpj_basico`.")
-        except Exception as e:
-            logging.warning(f"Não foi possível criar os índices. Eles podem já existir. Erro: {e}")
-
-# =============================================================================
 # FUNÇÕES DE PROCESSAMENTO E CARGA DE DADOS (OTIMIZADAS)
 # =============================================================================
 
@@ -436,10 +499,7 @@ def process_table_files(engine, table_name, files, schema, extracted_path, confi
             )
 
             for i, chunk in enumerate(reader):
-                if config["bulk_insert"]:
-                    bulk_insert_to_sql(engine, chunk, table_name)
-                else:
-                    standard_insert_to_sql(engine, chunk, table_name)
+                standard_insert_to_sql(engine, chunk, table_name)
                 
                 total_rows_inserted += len(chunk)
                 logging.info(f'    Lote {i+1} inserido: {len(chunk)} linhas (Total: {total_rows_inserted})')
@@ -458,37 +518,6 @@ def process_table_files(engine, table_name, files, schema, extracted_path, confi
     tempo_insert = round(time.time() - insert_start)
     logging.info(f"Tabela {table_name.upper()} finalizada! {total_rows_inserted} linhas inseridas em {tempo_insert}s.")
 
-def bulk_insert_to_sql(engine, df, table_name):
-    """Insere dados usando método bulk otimizado para SQL Server."""
-    try:
-        # Cria um arquivo temporário para bulk insert
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False, encoding='utf-8') as tmpfile:
-            # Salva o DataFrame como CSV
-            df.to_csv(tmpfile.name, index=False, header=False, sep='|')
-            temp_file_path = tmpfile.name
-
-        # Executa comando BULK INSERT do SQL Server
-        with engine.connect() as conn:
-            conn.execute(text(f"""
-                BULK INSERT {table_name}
-                FROM '{temp_file_path}'
-                WITH (
-                    FIELDTERMINATOR = '|',
-                    ROWTERMINATOR = '\\n',
-                    TABLOCK,
-                    BATCHSIZE = {BULK_INSERT_BATCH},
-                    MAXERRORS = 1000
-                )
-            """))
-        
-        # Remove arquivo temporário
-        os.unlink(temp_file_path)
-        
-    except Exception as error:
-        logging.error(f"Erro no bulk insert para a tabela {table_name}: {error}")
-        # Fallback para insert padrão
-        standard_insert_to_sql(engine, df, table_name)
-
 def standard_insert_to_sql(engine, df, table_name):
     """Insere dados usando método padrão do pandas."""
     try:
@@ -498,11 +527,23 @@ def standard_insert_to_sql(engine, df, table_name):
             if_exists='append', 
             index=False, 
             chunksize=10000,
-            method='multi'  # Insere múltiplas linhas por vez
+            method='multi'
         )
     except Exception as error:
         logging.error(f"Erro ao inserir dados na tabela {table_name}: {error}")
-        raise
+        # Tenta inserir em chunks menores em caso de erro
+        try:
+            for i in range(0, len(df), 5000):
+                chunk = df.iloc[i:i+5000]
+                chunk.to_sql(
+                    table_name, 
+                    con=engine, 
+                    if_exists='append', 
+                    index=False
+                )
+        except Exception as error2:
+            logging.error(f"Erro persistente ao inserir dados: {error2}")
+            raise
 
 def classify_files(extracted_path):
     """Classifica os arquivos extraídos em categorias de tabelas."""
@@ -575,8 +616,8 @@ def main():
     # 3. Conexão e Configuração do Banco de Dados
     logging.info("Iniciando preparação do banco de dados...")
     
-    # Conecta ao banco mestre para criar o banco de dados se necessário
-    master_engine = get_db_engine(config, db_name='master')
+    # Conecta ao banco postgres para criar o banco de dados se necessário
+    master_engine = get_db_engine(config, db_name='postgres')
     
     # Cria o banco de dados se não existir
     prepare_database(master_engine, config["db_name"])
@@ -601,8 +642,8 @@ def main():
 
     total_time = round(time.time() - start_time)
     logging.info(f"--- PROCESSO 100% FINALIZADO EM {total_time} SEGUNDOS! ---")
-    logging.info("Você já pode usar seus dados no SQL Server.")
-    logging.info("Contribua com esse projeto em: https://github.com/aphonsoar/Receita_Federal_do_Brasil_-_Dados_Publicos_CNPJ")
+    logging.info("Você já pode usar seus dados no PostgreSQL.")
+    logging.info("Contribua com esse projeto em: https://github.com/luciocordeiro/dibaisales")
 
 if __name__ == '__main__':
     main()
